@@ -78,7 +78,7 @@ class RecurrentBlockDummy(chainer.Chain): # NOTE : This Link has no memory abili
 
         return h
 
-class ControllerSubfunctions:
+class Helper:
     @staticmethod
     def oneplus(x):
         return 1 + F.log(1 + F.exp(x))
@@ -89,11 +89,11 @@ class ControllerSubfunctions:
         offs = 0
         read_keys = F.reshape(xi[:, offs:offs+width*n_read_heads], (batch_size, n_read_heads, width))
         offs += width * n_read_heads
-        read_strengths = ControllerSubfunctions.oneplus(F.reshape(xi[:, offs:offs+n_read_heads], (batch_size, n_read_heads)))
+        read_strengths = Helper.oneplus(F.reshape(xi[:, offs:offs+n_read_heads], (batch_size, n_read_heads)))
         offs += n_read_heads
         write_key = xi[:, offs:offs+width]
         offs += width
-        write_strength = ControllerSubfunctions.oneplus(xi[:, offs])
+        write_strength = Helper.oneplus(xi[:, offs])
         offs += 1
         erase_vector = F.sigmoid(xi[:, offs:offs+width])
         offs += width
@@ -206,14 +206,14 @@ class ControllerSubfunctions:
     def write_content_weighting(memory_prev, write_key, write_strength):
         """ (batch_size,n_locations,width) -> (batch_size,width) -> (batch_size,) -> (batch_size,n_locations) """
         batch_size, n_locations = memory_prev.shape[0], memory_prev.shape[1]
-        c = ControllerSubfunctions.content_based_addressing(memory_prev, write_key[:, None, :], write_strength[:, None])
+        c = Helper.content_based_addressing(memory_prev, write_key[:, None, :], write_strength[:, None])
         r = F.reshape(c, (batch_size, n_locations))
         return r
 
     @staticmethod
     def read_content_weightings(memory, read_keys, read_strengths):
         """ (batch_size,n_locations,width) -> (batch_size,n_read_heads,width) -> (batch_size,n_read_heads) -> (batch_size,n_read_heads,n_locations) """
-        return ControllerSubfunctions.content_based_addressing(memory, read_keys, read_strengths)
+        return Helper.content_based_addressing(memory, read_keys, read_strengths)
 
     @staticmethod
     def read_weightings(read_modes, backward_weightings, read_content_weightings, forward_weightings):
@@ -230,11 +230,11 @@ class ControllerSubfunctions:
         return F.hstack([x, F.reshape(read_vectors, (batch_size, -1))])
 
     @staticmethod
-    def join_hs(hs):
+    def hs_joined(hs):
         return F.hstack(hs)
 
     @staticmethod
-    def join_read_vectors(read_vectors):
+    def read_vectors_joined(read_vectors):
         batch_size = read_vectors.shape[0]
         return F.reshape(read_vectors, (batch_size, -1))
 
@@ -257,13 +257,13 @@ class DefaultController(chainer.Chain):
         self.reset_state()
 
     def __call__(self, chi):
-        f = ControllerSubfunctions
+        f = Helper
 
         hs = [None] * (self.n_layers+1)
         for i in range(self.n_layers):
             hs[i+1] = self.hidden_layers[i](chi, hs[i+1])
 
-        hs_joined = f.join_hs(hs[1:])
+        hs_joined = f.hs_joined(hs[1:])
         ypsilon = self.linear_yps(hs_joined)
         xi = self.linear_xi(hs_joined)
         return (ypsilon, xi)
@@ -285,7 +285,7 @@ class Core(chainer.Chain):
         self.reset_state()
 
     def __call__(self, x):
-        f = ControllerSubfunctions
+        f = Helper
         batch_size = x.shape[0]
         if self.min_batch_size is None:
             self.min_batch_size = batch_size
@@ -300,14 +300,14 @@ class Core(chainer.Chain):
 
         chi = f.controller_input_vector(x, read_vectors)
         ypsilon, xi = self.controller(chi)
-        rvs_joined = f.join_read_vectors(read_vectors)
+        rvs_joined = f.read_vectors_joined(read_vectors)
         y = ypsilon + self.linear_r(rvs_joined)
         self.process_interface_vector(xi)
 
         return y
 
     def process_interface_vector(self, xi):
-        f = ControllerSubfunctions
+        f = Helper
         batch_size = xi.shape[0]
         (read_keys, read_strengths, write_key, write_strength,
          erase_vector, write_vector, free_gates, allocation_gate,
