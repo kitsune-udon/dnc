@@ -4,11 +4,150 @@ import chainer
 import chainer.links as L
 import chainer.functions as F
 
-def var_fzero(shape):
+def var_fzeros(shape):
     return chainer.Variable(np.zeros(shape, dtype=np.float32))
 
 def var_fones(shape):
     return chainer.Variable(np.ones(shape, dtype=np.float32))
+
+def oneplus(x):
+    return 1 + F.log(1 + F.exp(x))
+
+def extract_params(xi, width, n_read_heads):
+    batch_size = xi.shape[0]
+    offs = 0
+    read_keys = F.reshape(xi[:, offs:offs+width*n_read_heads], (batch_size, n_read_heads, width))
+    offs += width * n_read_heads
+    read_strengths = oneplus(F.reshape(xi[:, offs:offs+n_read_heads], (batch_size, n_read_heads)))
+    offs += n_read_heads
+    write_key = xi[:, offs:offs+width]
+    offs += width
+    write_strength = oneplus(xi[:, offs])
+    offs += 1
+    erase_vector = F.sigmoid(xi[:, offs:offs+width])
+    offs += width
+    write_vector = xi[:, offs:offs+width]
+    offs += width
+    free_gates = F.sigmoid(F.reshape(xi[:, offs:offs+n_read_heads], (batch_size, n_read_heads)))
+    offs += n_read_heads
+    allocation_gate = F.sigmoid(xi[:, offs])
+    write_gate = F.sigmoid(xi[:, offs+1])
+    offs += 2
+    read_modes = F.reshape(F.softmax(F.reshape(xi[:, offs:offs+3*n_read_heads], (-1, 3))), (batch_size, n_read_heads, 3))
+    return (read_keys, read_strengths, write_key, write_strength,
+            erase_vector, write_vector, free_gates, allocation_gate,
+            write_gate, read_modes)
+
+def read_vectors(memory, read_weightings):
+    """ (batch_size,n_locations,width) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,width) """
+    return F.batch_matmul(read_weightings, memory)
+
+def updated_memory(memory, write_weighting, erase_vector, write_vector):
+    """ (batch_size,n_locations,width) -> (batch_size,n_locations) -> (batch_size,width) -> (batch_size,width) -> (batch_size,n_locations,width) """
+    mem, w, e, v = memory, write_weighting, erase_vector, write_vector
+    r = mem * (1 - F.batch_matmul(w, e, transb=True)) + F.batch_matmul(w, v, transb=True)
+    return r
+
+def content_based_addressing(memory, keys, strengths):
+    """ (M,n_locations,width) -> (M,N,width) -> (M,N) -> (M,N,n_locations) """
+    M, n_locations, width = memory.shape
+    N = keys.shape[1]
+    m, k, s = memory, keys, strengths
+    m = F.reshape(F.normalize(F.reshape(m, (-1, width))), (M, n_locations, width))
+    k = F.reshape(F.normalize(F.reshape(k, (-1, width))), (M, N, width))
+    t = F.scale(F.batch_matmul(k, m, transb=True), s, axis=0)
+    r = F.reshape(F.softmax(F.reshape(t, (-1, n_locations))), (M, N, n_locations))
+    return r
+
+def memory_retention_vector(free_gates, read_weightings_prev):
+    """ (batch_size,n_read_heads) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_locations) """
+    batch_size, n_read_heads = free_gates.shape
+    n_locations = read_weightings_prev.shape[2]
+    t = 1 - F.scale(read_weightings_prev, free_gates, axis=0)
+    r = var_fones((batch_size, n_locations))
+    for i in range(n_read_heads):
+        r *= t[:, i, :]
+    return r
+
+def updated_usage_vector(usage_vector_prev, write_weighting_prev, psi):
+    """ (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) """
+    u, w = usage_vector_prev, write_weighting_prev
+    r = (u + w - u * w) * psi
+    return r
+
+def allocation_weighting(usage_vector): # NOTE: not differentiable
+    """ (batch_size,n_locations) -> (batch_size,n_locations) """
+    batch_size, n_locations = usage_vector.shape
+    u = usage_vector.data
+    phi = np.argsort(u, axis=1)
+    s = np.ones(batch_size, dtype=np.float32)
+    a = np.zeros((batch_size, n_locations), dtype=np.float32)
+    asc = np.arange(batch_size).astype(np.int32)
+    for j in range(n_locations):
+        k = phi[:, j]
+        t = u[asc, k]
+        a[asc, k] = (1 - t) * s
+        s *= t
+    return a
+
+def write_weighting(allocation_gate, write_gate, allocation_weighting, write_content_weighting):
+    """ (batch_size,) -> (batch_size,) -> (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) """
+    ga, gw, a, c = allocation_gate, write_gate, allocation_weighting, write_content_weighting
+    r =  F.scale((F.scale(a, ga, axis=0) + F.scale(c, 1 - ga, axis=0)), gw, axis=0)
+    return r
+
+def precedence_weighting(write_weighting, precedence_weighting_prev):
+    """ (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) """
+    w, p = write_weighting, precedence_weighting_prev
+    r = F.scale(p, (1 - F.sum(w, axis=1)), axis=0) + w
+    return r
+
+def updated_link_matrix(link_matrix_prev, write_weighting, precedence_weighting_prev):
+    """ (batch_size,n_locations,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations,n_locations) """
+    l0, w, p = link_matrix_prev, write_weighting, precedence_weighting_prev
+    batch_size, n_locations = w.shape[0], w.shape[1]
+    wrep = F.broadcast_to(w[:, :, None], l0.shape)
+    l = (1 - wrep - F.transpose(wrep, (0, 2, 1))) * l0 + F.batch_matmul(w, p, transb=True)
+    r = l * (1 - np.eye(n_locations, dtype=np.float32))
+    return r
+
+def forward_weightings(link_matrix, read_weightings_prev):
+    """ (batch_size,n_locations,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) """
+    return F.batch_matmul(read_weightings_prev, link_matrix, transb=True)
+
+def backward_weightings(link_matrix, read_weightings_prev):
+    """ (batch_size,n_locations,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) """
+    return F.batch_matmul(read_weightings_prev, link_matrix)
+
+def write_content_weighting(memory_prev, write_key, write_strength):
+    """ (batch_size,n_locations,width) -> (batch_size,width) -> (batch_size,) -> (batch_size,n_locations) """
+    batch_size, n_locations = memory_prev.shape[0], memory_prev.shape[1]
+    c = content_based_addressing(memory_prev, write_key[:, None, :], write_strength[:, None])
+    r = F.reshape(c, (batch_size, n_locations))
+    return r
+
+def read_content_weightings(memory, read_keys, read_strengths):
+    """ (batch_size,n_locations,width) -> (batch_size,n_read_heads,width) -> (batch_size,n_read_heads) -> (batch_size,n_read_heads,n_locations) """
+    return content_based_addressing(memory, read_keys, read_strengths)
+
+def read_weightings(read_modes, backward_weightings, read_content_weightings, forward_weightings):
+    """ (batch_size,n_read_heads,3) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) """
+    pi, b, c, f = read_modes, backward_weightings, read_content_weightings, forward_weightings
+    x = F.scale(b, pi[:, :, 0], axis=0)
+    y = F.scale(c, pi[:, :, 1], axis=0)
+    z = F.scale(f, pi[:, :, 2], axis=0)
+    return x + y + z
+
+def controller_input_vector(x, read_vectors):
+    batch_size = x.shape[0]
+    return F.hstack([x, F.reshape(read_vectors, (batch_size, -1))])
+
+def hidden_layers_joined(hs):
+    return F.hstack(hs)
+
+def read_vectors_joined(read_vectors):
+    batch_size = read_vectors.shape[0]
+    return F.reshape(read_vectors, (batch_size, -1))
 
 class RecurrentBlock(chainer.Chain):
     def __init__(self, n_units_of_input, n_units_of_hidden_layer):
@@ -31,12 +170,12 @@ class RecurrentBlock(chainer.Chain):
             self.max_batch_size = batch_size
 
         if self.h is None:
-            h_prev = var_fzero((batch_size, self.n_units_of_hidden_layer))
+            h_prev = var_fzeros((batch_size, self.n_units_of_hidden_layer))
         else:
             h_prev = self.h[0:batch_size]
 
         if h_in is None:
-            h_in = var_fzero((batch_size, self.n_units_of_hidden_layer))
+            h_in = var_fzeros((batch_size, self.n_units_of_hidden_layer))
         else:
             assert(batch_size == h_in.shape[0])
 
@@ -68,7 +207,7 @@ class RecurrentBlockDummy(chainer.Chain): # NOTE : This Link has no memory abili
         batch_size = input_vector.shape[0]
 
         if h_in is None:
-            h_in = var_fzero((batch_size, self.n_units_of_hidden_layer))
+            h_in = var_fzeros((batch_size, self.n_units_of_hidden_layer))
         else:
             assert(h_in.shape[0] >= batch_size)
             h_in = h_in[0:batch_size]
@@ -77,166 +216,6 @@ class RecurrentBlockDummy(chainer.Chain): # NOTE : This Link has no memory abili
         h = F.tanh(self.l1(v))
 
         return h
-
-class Helper:
-    @staticmethod
-    def oneplus(x):
-        return 1 + F.log(1 + F.exp(x))
-
-    @staticmethod
-    def extract_params(xi, width, n_read_heads):
-        batch_size = xi.shape[0]
-        offs = 0
-        read_keys = F.reshape(xi[:, offs:offs+width*n_read_heads], (batch_size, n_read_heads, width))
-        offs += width * n_read_heads
-        read_strengths = Helper.oneplus(F.reshape(xi[:, offs:offs+n_read_heads], (batch_size, n_read_heads)))
-        offs += n_read_heads
-        write_key = xi[:, offs:offs+width]
-        offs += width
-        write_strength = Helper.oneplus(xi[:, offs])
-        offs += 1
-        erase_vector = F.sigmoid(xi[:, offs:offs+width])
-        offs += width
-        write_vector = xi[:, offs:offs+width]
-        offs += width
-        free_gates = F.sigmoid(F.reshape(xi[:, offs:offs+n_read_heads], (batch_size, n_read_heads)))
-        offs += n_read_heads
-        allocation_gate = F.sigmoid(xi[:, offs])
-        write_gate = F.sigmoid(xi[:, offs+1])
-        offs += 2
-        read_modes = F.reshape(F.softmax(F.reshape(xi[:, offs:offs+3*n_read_heads], (-1, 3))), (batch_size, n_read_heads, 3))
-        return (read_keys, read_strengths, write_key, write_strength,
-                erase_vector, write_vector, free_gates, allocation_gate,
-                write_gate, read_modes)
-
-    @staticmethod
-    def read_vectors(memory, read_weightings):
-        """ (batch_size,n_locations,width) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,width) """
-        return F.batch_matmul(read_weightings, memory)
-
-    @staticmethod
-    def updated_memory(memory, write_weighting, erase_vector, write_vector):
-        """ (batch_size,n_locations,width) -> (batch_size,n_locations) -> (batch_size,width) -> (batch_size,width) -> (batch_size,n_locations,width) """
-        mem, w, e, v = memory, write_weighting, erase_vector, write_vector
-        r = mem * (1 - F.batch_matmul(w, e, transb=True)) + F.batch_matmul(w, v, transb=True)
-        return r
-
-    @staticmethod
-    def content_based_addressing(memory, keys, strengths):
-        """ (M,n_locations,width) -> (M,N,width) -> (M,N) -> (M,N,n_locations) """
-        M, n_locations, width = memory.shape
-        N = keys.shape[1]
-        m, k, s = memory, keys, strengths
-        m = F.reshape(F.normalize(F.reshape(m, (-1, width))), (M, n_locations, width))
-        k = F.reshape(F.normalize(F.reshape(k, (-1, width))), (M, N, width))
-        t = F.scale(F.batch_matmul(k, m, transb=True), s, axis=0)
-        r = F.reshape(F.softmax(F.reshape(t, (-1, n_locations))), (M, N, n_locations))
-        return r
-
-
-    @staticmethod
-    def memory_retention_vector(free_gates, read_weightings_prev):
-        """ (batch_size,n_read_heads) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_locations) """
-        batch_size, n_read_heads = free_gates.shape
-        n_locations = read_weightings_prev.shape[2]
-        t = 1 - F.scale(read_weightings_prev, free_gates, axis=0)
-        r = var_fones((batch_size, n_locations))
-        for i in range(n_read_heads):
-            r *= t[:, i, :]
-        return r
-
-    @staticmethod
-    def updated_usage_vector(usage_vector_prev, write_weighting_prev, psi):
-        """ (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) """
-        u, w = usage_vector_prev, write_weighting_prev
-        r = (u + w - u * w) * psi
-        return r
-
-    @staticmethod
-    def allocation_weighting(usage_vector): # NOTE: not differentiable
-        """ (batch_size,n_locations) -> (batch_size,n_locations) """
-        batch_size, n_locations = usage_vector.shape
-        u = usage_vector.data
-        phi = np.argsort(u, axis=1)
-        s = np.ones(batch_size, dtype=np.float32)
-        a = np.zeros((batch_size, n_locations), dtype=np.float32)
-        asc = np.arange(batch_size).astype(np.int32)
-        for j in range(n_locations):
-            k = phi[:, j]
-            t = u[asc, k]
-            a[asc, k] = (1 - t) * s
-            s *= t
-        return a
-
-    @staticmethod
-    def write_weighting(allocation_gate, write_gate, allocation_weighting, write_content_weighting):
-        """ (batch_size,) -> (batch_size,) -> (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) """
-        ga, gw, a, c = allocation_gate, write_gate, allocation_weighting, write_content_weighting
-        r =  F.scale((F.scale(a, ga, axis=0) + F.scale(c, 1 - ga, axis=0)), gw, axis=0)
-        return r
-
-    @staticmethod
-    def precedence_weighting(write_weighting, precedence_weighting_prev):
-        """ (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) """
-        w, p = write_weighting, precedence_weighting_prev
-        r = F.scale(p, (1 - F.sum(w, axis=1)), axis=0) + w
-        return r
-
-    @staticmethod
-    def updated_link_matrix(link_matrix_prev, write_weighting, precedence_weighting_prev):
-        """ (batch_size,n_locations,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations) -> (batch_size,n_locations,n_locations) """
-        l0, w, p = link_matrix_prev, write_weighting, precedence_weighting_prev
-        batch_size, n_locations = w.shape[0], w.shape[1]
-        wrep = F.broadcast_to(w[:, :, None], l0.shape)
-        l = (1 - wrep - F.transpose(wrep, (0, 2, 1))) * l0 + F.batch_matmul(w, p, transb=True)
-        r = l * (1 - np.eye(n_locations, dtype=np.float32))
-        return r
-
-    @staticmethod
-    def forward_weightings(link_matrix, read_weightings_prev):
-        """ (batch_size,n_locations,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) """
-        return F.batch_matmul(read_weightings_prev, link_matrix, transb=True)
-
-    @staticmethod
-    def backward_weightings(link_matrix, read_weightings_prev):
-        """ (batch_size,n_locations,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) """
-        return F.batch_matmul(read_weightings_prev, link_matrix)
-
-    @staticmethod
-    def write_content_weighting(memory_prev, write_key, write_strength):
-        """ (batch_size,n_locations,width) -> (batch_size,width) -> (batch_size,) -> (batch_size,n_locations) """
-        batch_size, n_locations = memory_prev.shape[0], memory_prev.shape[1]
-        c = Helper.content_based_addressing(memory_prev, write_key[:, None, :], write_strength[:, None])
-        r = F.reshape(c, (batch_size, n_locations))
-        return r
-
-    @staticmethod
-    def read_content_weightings(memory, read_keys, read_strengths):
-        """ (batch_size,n_locations,width) -> (batch_size,n_read_heads,width) -> (batch_size,n_read_heads) -> (batch_size,n_read_heads,n_locations) """
-        return Helper.content_based_addressing(memory, read_keys, read_strengths)
-
-    @staticmethod
-    def read_weightings(read_modes, backward_weightings, read_content_weightings, forward_weightings):
-        """ (batch_size,n_read_heads,3) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) -> (batch_size,n_read_heads,n_locations) """
-        pi, b, c, f = read_modes, backward_weightings, read_content_weightings, forward_weightings
-        x = F.scale(b, pi[:, :, 0], axis=0)
-        y = F.scale(c, pi[:, :, 1], axis=0)
-        z = F.scale(f, pi[:, :, 2], axis=0)
-        return x + y + z
-
-    @staticmethod
-    def controller_input_vector(x, read_vectors):
-        batch_size = x.shape[0]
-        return F.hstack([x, F.reshape(read_vectors, (batch_size, -1))])
-
-    @staticmethod
-    def hs_joined(hs):
-        return F.hstack(hs)
-
-    @staticmethod
-    def read_vectors_joined(read_vectors):
-        batch_size = read_vectors.shape[0]
-        return F.reshape(read_vectors, (batch_size, -1))
 
 class DefaultController(chainer.Chain):
     def __init__(self, controller_input_vector_dim, output_dim, interface_vector_dim, n_units_of_hidden_layer, n_layers, norecurrent=False):
@@ -257,13 +236,11 @@ class DefaultController(chainer.Chain):
         self.reset_state()
 
     def __call__(self, chi):
-        f = Helper
-
         hs = [None] * (self.n_layers+1)
         for i in range(self.n_layers):
             hs[i+1] = self.hidden_layers[i](chi, hs[i+1])
 
-        hs_joined = f.hs_joined(hs[1:])
+        hs_joined = hidden_layers_joined(hs[1:])
         ypsilon = self.linear_yps(hs_joined)
         xi = self.linear_xi(hs_joined)
         return (ypsilon, xi)
@@ -285,7 +262,6 @@ class Core(chainer.Chain):
         self.reset_state()
 
     def __call__(self, x):
-        f = Helper
         batch_size = x.shape[0]
         if self.min_batch_size is None:
             self.min_batch_size = batch_size
@@ -294,68 +270,67 @@ class Core(chainer.Chain):
             self.min_batch_size = batch_size
 
         if self.read_vectors is None:
-            read_vectors = var_fzero((batch_size, self.n_read_heads, self.memory_width))
+            read_vectors = var_fzeros((batch_size, self.n_read_heads, self.memory_width))
         else:
             read_vectors = self.read_vectors[0:batch_size]
 
-        chi = f.controller_input_vector(x, read_vectors)
+        chi = controller_input_vector(x, read_vectors)
         ypsilon, xi = self.controller(chi)
-        rvs_joined = f.read_vectors_joined(read_vectors)
+        rvs_joined = read_vectors_joined(read_vectors)
         y = ypsilon + self.linear_r(rvs_joined)
         self.process_interface_vector(xi)
 
         return y
 
     def process_interface_vector(self, xi):
-        f = Helper
         batch_size = xi.shape[0]
         (read_keys, read_strengths, write_key, write_strength,
          erase_vector, write_vector, free_gates, allocation_gate,
-         write_gate, read_modes) = f.extract_params(xi, self.memory_width, self.n_read_heads)
+         write_gate, read_modes) = extract_params(xi, self.memory_width, self.n_read_heads)
 
         if self.ws_read is None:
-            ws_read_prev = var_fzero((batch_size, self.n_read_heads, self.n_locations))
+            ws_read_prev = var_fzeros((batch_size, self.n_read_heads, self.n_locations))
         else:
             ws_read_prev = self.ws_read[0:batch_size]
 
         if self.w_write is None:
-            w_write_prev = var_fzero((batch_size, self.n_locations))
+            w_write_prev = var_fzeros((batch_size, self.n_locations))
         else:
             w_write_prev = self.w_write[0:batch_size]
 
         if self.p is None:
-            p_prev = var_fzero((batch_size, self.n_locations))
+            p_prev = var_fzeros((batch_size, self.n_locations))
         else:
             p_prev = self.p[0:batch_size]
 
         if self.memory is None:
-            memory_prev = var_fzero((batch_size, self.n_locations, self.memory_width))
+            memory_prev = var_fzeros((batch_size, self.n_locations, self.memory_width))
         else:
             memory_prev = self.memory[0:batch_size]
 
         if self.link_matrix is None:
-            link_matrix_prev = var_fzero((batch_size, self.n_locations, self.n_locations))
+            link_matrix_prev = var_fzeros((batch_size, self.n_locations, self.n_locations))
         else:
             link_matrix_prev = self.link_matrix[0:batch_size]
 
         if self.u is None:
-            u_prev = var_fzero((batch_size, self.n_locations))
+            u_prev = var_fzeros((batch_size, self.n_locations))
         else:
             u_prev = self.u[0:batch_size]
 
-        psi = f.memory_retention_vector(free_gates, ws_read_prev)
-        u = f.updated_usage_vector(u_prev, w_write_prev, psi)
-        a = f.allocation_weighting(u)
-        c_w = f.write_content_weighting(memory_prev, write_key, write_strength)
-        w_write= f.write_weighting(allocation_gate, write_gate, a, c_w)
-        p = f.precedence_weighting(w_write, p_prev)
-        link_matrix = f.updated_link_matrix(link_matrix_prev, w_write, p_prev)
-        fs = f.forward_weightings(link_matrix, ws_read_prev)
-        bs = f.backward_weightings(link_matrix, ws_read_prev)
-        memory = f.updated_memory(memory_prev, w_write, erase_vector, write_vector)
-        cs_r = f.read_content_weightings(memory, read_keys, read_strengths)
-        ws_read = f.read_weightings(read_modes, bs, cs_r, fs)
-        vs_read = f.read_vectors(memory, ws_read)
+        psi = memory_retention_vector(free_gates, ws_read_prev)
+        u = updated_usage_vector(u_prev, w_write_prev, psi)
+        a = allocation_weighting(u)
+        c_w = write_content_weighting(memory_prev, write_key, write_strength)
+        w_write= write_weighting(allocation_gate, write_gate, a, c_w)
+        p = precedence_weighting(w_write, p_prev)
+        link_matrix = updated_link_matrix(link_matrix_prev, w_write, p_prev)
+        fs = forward_weightings(link_matrix, ws_read_prev)
+        bs = backward_weightings(link_matrix, ws_read_prev)
+        memory = updated_memory(memory_prev, w_write, erase_vector, write_vector)
+        cs_r = read_content_weightings(memory, read_keys, read_strengths)
+        ws_read = read_weightings(read_modes, bs, cs_r, fs)
+        vs_read = read_vectors(memory, ws_read)
 
         self.ws_read = ws_read
         self.w_write = w_write

@@ -61,7 +61,7 @@ def test(model, n_vocab, max_length):
     return rs
 
 def main():
-    parser = argparse.ArgumentParser(description="An experiment of Differentiable Neural Computer : Echo tasks of variable length sequences")
+    parser = argparse.ArgumentParser(description="An experiment of Differentiable Neural Computers : Echo tasks of variable length sequences")
 
     parser.add_argument('--seq_len', type=int, default=5, metavar='N',
             help='length of a sequence used by learning')
