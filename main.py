@@ -67,17 +67,17 @@ def main():
             help='length of a sequence used by learning')
     parser.add_argument('--n_vocab', type=int, default=11, metavar='N',
             help='number of vocabulary')
-    parser.add_argument('--embed_dim', type=int, default=4, metavar='N',
+    parser.add_argument('--embed_dim', type=int, default=11, metavar='N',
             help="dimension of vacabulary's inner representation")
-    parser.add_argument('--n_locations', type=int, default=16, metavar='N',
+    parser.add_argument('--n_locations', type=int, default=8, metavar='N',
             help='number of memory slots')
-    parser.add_argument('--memory_width', type=int, default=32, metavar='N',
+    parser.add_argument('--memory_width', type=int, default=8, metavar='N',
             help='number of elements in a memory slot')
-    parser.add_argument('--n_read_heads', type=int, default=2, metavar='N',
+    parser.add_argument('--n_read_heads', type=int, default=1, metavar='N',
             help='number of read heads')
-    parser.add_argument('--n_layers', type=int, default=3, metavar='N',
+    parser.add_argument('--n_layers', type=int, default=1, metavar='N',
             help='number of hidden layers of the DNC controller')
-    parser.add_argument('--n_units', type=int, default=50, metavar='N',
+    parser.add_argument('--n_units', type=int, default=25, metavar='N',
             help="number of units the DNC controller's hidden layer uses")
     parser.add_argument('--n_iter', type=int, default=100000, metavar='N',
             help='number of learning iteration')
