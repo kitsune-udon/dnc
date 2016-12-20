@@ -34,7 +34,7 @@ def compute_loss(model, sample_seq):
         x, t = sample_seq[i]
         x0 = chainer.Variable(np.array([x]*batch_size, dtype=np.int32))
         y0 = model(x0)
-        if not i < (seq_len / 2):
+        if not i < (seq_len // 2):
             loss += F.softmax_cross_entropy(y0, np.array([t]*batch_size, dtype=np.int32))
     return loss
 
