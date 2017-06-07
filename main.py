@@ -44,8 +44,8 @@ def draw_sample(n_vocab, variable=True, max_length=7):
     else:
         length = max_length
     a = 1 + np.random.randint(n_vocab-1, size=length)
-    b = zip(a, a)
-    c = zip([0]*length, a)
+    b = list(zip(a, a))
+    c = list(zip([0]*length, a))
     d = b + c
     return d
 
